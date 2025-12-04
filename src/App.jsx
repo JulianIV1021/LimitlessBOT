@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { 
   Wallet, Activity, TrendingUp, TrendingDown, Settings, Play, Pause, 
   RefreshCw, Zap, Trophy, Target, Clock, DollarSign, BarChart3,
@@ -11,6 +11,7 @@ import {
 const BASE_CHAIN_ID = 8453;
 const BASE_RPC = 'https://mainnet.base.org';
 const LIMITLESS_API = 'https://api.limitless.exchange/api-v1';
+const LIMITLESS_AUTH_API = 'https://api.limitless.exchange';
 
 const SUPPORTED_ASSETS = [
   { id: 'BTC', name: 'Bitcoin', icon: '₿', color: '#F7931A' },
@@ -105,6 +106,8 @@ export default function LimitlessTradingBot() {
   const [balance, setBalance] = useState(0);
   const [isConnecting, setIsConnecting] = useState(false);
   const [authToken, setAuthToken] = useState(null);
+  const [authStatus, setAuthStatus] = useState('idle');
+  const [authError, setAuthError] = useState('');
   
   // Market State
   const [selectedAssets, setSelectedAssets] = useState(['BTC', 'ETH', 'SOL']);
@@ -150,6 +153,34 @@ export default function LimitlessTradingBot() {
   // Refs
   const botIntervalRef = useRef(null);
   const priceUpdateRef = useRef(null);
+
+  // Derived strategy math (gabagool hedge)
+  const gabagoolMath = useMemo(() => {
+    const totals = positions.reduce(
+      (acc, pos) => {
+        acc.qtyYes += pos.yesShares;
+        acc.qtyNo += pos.noShares;
+        acc.costYes += pos.yesCost;
+        acc.costNo += pos.noCost;
+        return acc;
+      },
+      { qtyYes: 0, qtyNo: 0, costYes: 0, costNo: 0 }
+    );
+
+    const avgYes = totals.qtyYes ? totals.costYes / totals.qtyYes : 0;
+    const avgNo = totals.qtyNo ? totals.costNo / totals.qtyNo : 0;
+    const pairCost = avgYes + avgNo;
+    const lockedProfit = Math.max(0, Math.min(totals.qtyYes, totals.qtyNo) - (totals.costYes + totals.costNo));
+
+    return {
+      ...totals,
+      avgYes,
+      avgNo,
+      pairCost: Number(pairCost.toFixed(4)),
+      lockedProfit,
+      safetyBuffer: 1 - pairCost,
+    };
+  }, [positions]);
 
   // ============= WALLET CONNECTION =============
   const connectWallet = async () => {
@@ -200,13 +231,16 @@ export default function LimitlessTradingBot() {
       
       // Mock balance for demo
       setBalance(1247.83);
-      
+
       addActivity('success', 'Wallet connected successfully');
       addActivity('info', 'Connected to Base network');
-      
+
       // Authenticate with Limitless
-      await authenticateWithLimitless(accounts[0]);
-      
+      const authOk = await authenticateWithLimitless(accounts[0]);
+      if (!authOk) {
+        addActivity('warning', 'Limitless authentication incomplete; trading may be limited');
+      }
+
     } catch (error) {
       addActivity('error', `Connection failed: ${error.message}`);
     } finally {
@@ -216,39 +250,76 @@ export default function LimitlessTradingBot() {
 
   const authenticateWithLimitless = async (address) => {
     try {
+      setAuthStatus('pending');
+      setAuthError('');
       addActivity('info', 'Authenticating with Limitless...');
-      
-      // In production: Sign EIP-712 message
-      const timestamp = Math.floor(Date.now() / 1000);
-      const message = {
-        message: `Sign this message to authenticate with Limitless Exchange. Timestamp: ${timestamp}`,
-        timestamp,
-      };
 
-      // For demo, skip actual signing
-      if (!demoMode && window.ethereum) {
-        const signature = await window.ethereum.request({
-          method: 'eth_signTypedData_v4',
-          params: [address, JSON.stringify({
-            types: AUTH_TYPES,
-            primaryType: 'Authentication',
-            domain: EIP712_DOMAIN,
-            message,
-          })],
-        });
-        setAuthToken(signature);
-      } else {
-        setAuthToken('demo-auth-token');
+      const signingRes = await fetch(`${LIMITLESS_AUTH_API}/auth/signing-message`);
+      if (!signingRes.ok) {
+        throw new Error('Unable to fetch signing message');
       }
-      
+
+      const signingMessage = await signingRes.text();
+
+      let signature = 'demo-signature';
+      if (!demoMode && window.ethereum) {
+        signature = await window.ethereum.request({
+          method: 'personal_sign',
+          params: [signingMessage, address],
+        });
+      }
+
+      const loginRes = await fetch(`${LIMITLESS_AUTH_API}/auth/login`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'x-account': address,
+          'x-signing-message': signingMessage,
+          'x-signature': signature,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          client: 'base',
+          smartWallet: limitlessWallet || undefined,
+          r: '',
+        }),
+      });
+
+      if (!loginRes.ok) {
+        throw new Error('Limitless login failed');
+      }
+
+      const loginData = await loginRes.json();
+      const smartWalletAddr = loginData.smartWallet || limitlessWallet || address;
+      setLimitlessWallet(smartWalletAddr);
+      setAuthToken(signature);
+      setAuthStatus('authenticated');
       addActivity('success', 'Authenticated with Limitless');
-      
-      // Generate mock Limitless wallet
-      const limitlessAddr = '0x' + [...Array(40)].map(() => Math.floor(Math.random() * 16).toString(16)).join('');
-      setLimitlessWallet(limitlessAddr);
-      
+
+      // Verify session cookie
+      try {
+        const verifyRes = await fetch(`${LIMITLESS_AUTH_API}/auth/verify-auth`, { credentials: 'include' });
+        if (!verifyRes.ok) {
+          throw new Error('Session verification failed');
+        }
+      } catch (verifyError) {
+        addActivity('warning', `Session verify warning: ${verifyError.message}`);
+      }
+
+      return true;
     } catch (error) {
+      setAuthStatus('error');
+      setAuthError(error.message);
       addActivity('error', `Authentication failed: ${error.message}`);
+      return false;
+    }
+  };
+
+  const logoutFromLimitless = async () => {
+    try {
+      await fetch(`${LIMITLESS_AUTH_API}/auth/logout`, { method: 'POST', credentials: 'include' });
+    } catch (err) {
+      addActivity('warning', `Logout warning: ${err.message}`);
     }
   };
 
@@ -258,7 +329,10 @@ export default function LimitlessTradingBot() {
     setLimitlessWallet('');
     setBalance(0);
     setAuthToken(null);
+    setAuthStatus('idle');
+    setAuthError('');
     setBotRunning(false);
+    logoutFromLimitless();
     addActivity('info', 'Wallet disconnected');
   };
 
@@ -750,14 +824,38 @@ export default function LimitlessTradingBot() {
                   </div>
                   <div className="flex items-center gap-2 mb-2">
                     <span className="font-mono text-sm">{formatAddress(limitlessWallet)}</span>
-                    <button 
+                    <button
                       onClick={() => copyToClipboard(limitlessWallet, 'limitless')}
                       className="p-1 hover:bg-white/5 rounded"
                     >
                       {copiedAddress === 'limitless' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3 text-slate-500" />}
                     </button>
                   </div>
-                  <div className="text-xs text-purple-400">Trading Wallet</div>
+                  <div className="text-xs flex items-center gap-2">
+                    <span className="text-purple-400">Trading Wallet</span>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] uppercase font-bold ${
+                        authStatus === 'authenticated'
+                          ? 'bg-emerald-500/10 text-emerald-400'
+                          : authStatus === 'pending'
+                          ? 'bg-amber-500/10 text-amber-400'
+                          : authStatus === 'error'
+                          ? 'bg-rose-500/10 text-rose-400'
+                          : 'bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      {authStatus === 'authenticated'
+                        ? 'Authed'
+                        : authStatus === 'pending'
+                        ? 'Authenticating'
+                        : authStatus === 'error'
+                        ? 'Auth Error'
+                        : 'Idle'}
+                    </span>
+                  </div>
+                  {authError && (
+                    <div className="text-xs text-rose-400 mt-1">{authError}</div>
+                  )}
                 </div>
 
                 {/* Balance */}
@@ -911,11 +1009,11 @@ export default function LimitlessTradingBot() {
                 <div className="grid grid-cols-4 gap-4">
                   <div className="p-4 rounded-xl bg-slate-800/50 border border-white/5">
                     <div className="text-xs text-slate-400 mb-1">Locked Profit</div>
-                    <div className="text-xl font-bold text-emerald-400">{formatUSD(stats.lockedProfit)}</div>
+                    <div className="text-xl font-bold text-emerald-400">{formatUSD(gabagoolMath.lockedProfit || stats.lockedProfit)}</div>
                   </div>
                   <div className="p-4 rounded-xl bg-slate-800/50 border border-white/5">
                     <div className="text-xs text-slate-400 mb-1">Avg Pair Cost</div>
-                    <div className="text-xl font-bold text-white">{formatUSD(stats.avgPairCost || 0)}</div>
+                    <div className="text-xl font-bold text-white">{formatUSD(gabagoolMath.pairCost || stats.avgPairCost || 0)}</div>
                   </div>
                   <div className="p-4 rounded-xl bg-slate-800/50 border border-white/5">
                     <div className="text-xs text-slate-400 mb-1">Total Trades</div>
@@ -924,6 +1022,70 @@ export default function LimitlessTradingBot() {
                   <div className="p-4 rounded-xl bg-slate-800/50 border border-white/5">
                     <div className="text-xs text-slate-400 mb-1">ROI</div>
                     <div className="text-xl font-bold text-cyan-400">{formatNumber(stats.roi, 1)}%</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Gabagool Strategy Math */}
+              <div className="rounded-2xl bg-slate-900/50 border border-white/5 p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <Sparkles className="w-5 h-5 text-emerald-400" />
+                    <div>
+                      <h3 className="font-semibold">Gabagool Hedge Math</h3>
+                      <p className="text-xs text-slate-400">Live totals for YES/NO legs and guaranteed payout math.</p>
+                    </div>
+                  </div>
+                  <div
+                    className={`px-3 py-1.5 rounded-lg text-sm font-semibold border ${
+                      gabagoolMath.pairCost > 0 && gabagoolMath.pairCost < settings.maxPairCost
+                        ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                        : 'bg-amber-500/10 text-amber-200 border-amber-500/30'
+                    }`}
+                  >
+                    Pair Cost: {formatUSD(gabagoolMath.pairCost || 0)}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                    <div className="text-xs text-emerald-300 mb-1">Qty YES</div>
+                    <div className="text-xl font-bold">{formatNumber(gabagoolMath.qtyYes, 2)}</div>
+                    <div className="text-xs text-emerald-400/70">Cost: {formatUSD(gabagoolMath.costYes)}</div>
+                  </div>
+                  <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/20">
+                    <div className="text-xs text-red-300 mb-1">Qty NO</div>
+                    <div className="text-xl font-bold text-red-200">{formatNumber(gabagoolMath.qtyNo, 2)}</div>
+                    <div className="text-xs text-red-400/70">Cost: {formatUSD(gabagoolMath.costNo)}</div>
+                  </div>
+                  <div className="p-4 rounded-xl bg-slate-800/70 border border-white/5">
+                    <div className="text-xs text-slate-400 mb-1">Average Prices</div>
+                    <div className="text-sm text-slate-200">YES avg: {formatUSD(gabagoolMath.avgYes || 0)}</div>
+                    <div className="text-sm text-slate-200">NO avg: {formatUSD(gabagoolMath.avgNo || 0)}</div>
+                  </div>
+                  <div className="p-4 rounded-xl bg-cyan-500/10 border border-cyan-500/20">
+                    <div className="text-xs text-cyan-200 mb-1">Safety Buffer</div>
+                    <div className="text-xl font-bold text-cyan-200">{formatPercent(gabagoolMath.safetyBuffer || 0)}</div>
+                    <div className="text-xs text-cyan-100/70">Target &lt; {formatUSD(settings.maxPairCost)}</div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="p-4 rounded-xl bg-purple-500/10 border border-purple-500/20">
+                    <div className="text-xs text-purple-200 mb-1">Guaranteed Profit (min side)</div>
+                    <div className="text-2xl font-bold text-purple-100">{formatUSD(gabagoolMath.lockedProfit)}</div>
+                    <p className="text-xs text-purple-100/70 mt-1">Min(Qty YES, Qty NO) - (Cost YES + Cost NO)</p>
+                  </div>
+                  <div className="p-4 rounded-xl bg-slate-800/70 border border-white/5">
+                    <div className="text-xs text-slate-400 mb-1">Coverage</div>
+                    <div className="text-lg font-semibold">{formatNumber(Math.min(gabagoolMath.qtyYes, gabagoolMath.qtyNo), 2)} shares hedged</div>
+                    <p className="text-xs text-slate-500 mt-1">Balanced legs increase guaranteed payout.</p>
+                  </div>
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                    <div className="text-xs text-emerald-300 mb-1">Next Action Cue</div>
+                    <p className="text-sm text-emerald-100">
+                      Keep pair cost below {formatUSD(settings.maxPairCost)} while buying dips (YES &lt; {formatUSD(settings.maxYesPrice)}, NO &lt; {formatUSD(settings.maxNoPrice)}).
+                    </p>
                   </div>
                 </div>
               </div>
