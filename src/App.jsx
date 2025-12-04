@@ -12,6 +12,7 @@ const BASE_CHAIN_ID = 8453;
 const BASE_RPC = 'https://mainnet.base.org';
 const LIMITLESS_API = 'https://api.limitless.exchange/api-v1';
 const LIMITLESS_AUTH_API = 'https://api.limitless.exchange';
+const USDC_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 
 const SUPPORTED_ASSETS = [
   { id: 'BTC', name: 'Bitcoin', icon: '₿', color: '#F7931A' },
@@ -67,6 +68,45 @@ const formatAddress = (addr) => addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}`
 const formatNumber = (num, decimals = 2) => Number(num).toFixed(decimals);
 const formatUSD = (num) => `$${formatNumber(num, 2)}`;
 const formatPercent = (num) => `${formatNumber(num * 100, 1)}%`;
+const normalizePrice = (value) => {
+  if (typeof value !== 'number') return 0;
+  return value > 1 ? value / 100 : value;
+};
+
+const buildBalanceOfData = (address) => {
+  const sanitized = address.replace('0x', '').padStart(64, '0');
+  return `0x70a08231000000000000000000000000${sanitized}`;
+};
+
+const fetchUSDCBalanceOnBase = async (address) => {
+  const body = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'eth_call',
+    params: [
+      { to: USDC_CONTRACT, data: buildBalanceOfData(address) },
+      'latest',
+    ],
+  };
+
+  const response = await fetch(BASE_RPC, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error('Unable to load USDC balance');
+  }
+
+  const { result } = await response.json();
+  if (!result) {
+    throw new Error('Empty balance response');
+  }
+
+  const balanceBigInt = BigInt(result);
+  return Number(balanceBigInt) / 1e6;
+};
 
 // Generate mock market data for demo
 const generateMockMarkets = (assets, marketType) => {
@@ -104,6 +144,8 @@ export default function LimitlessTradingBot() {
   const [walletAddress, setWalletAddress] = useState('');
   const [limitlessWallet, setLimitlessWallet] = useState('');
   const [balance, setBalance] = useState(0);
+  const [isBalanceLoading, setIsBalanceLoading] = useState(false);
+  const [balanceError, setBalanceError] = useState('');
   const [isConnecting, setIsConnecting] = useState(false);
   const [authToken, setAuthToken] = useState(null);
   const [authStatus, setAuthStatus] = useState('idle');
@@ -182,6 +224,21 @@ export default function LimitlessTradingBot() {
     };
   }, [positions]);
 
+  const updateSmartWalletBalance = useCallback(async (smartWalletAddr) => {
+    if (!smartWalletAddr) return;
+    setIsBalanceLoading(true);
+    setBalanceError('');
+    try {
+      const usdcBalance = await fetchUSDCBalanceOnBase(smartWalletAddr);
+      setBalance(usdcBalance);
+    } catch (error) {
+      setBalanceError(error.message);
+      addActivity('warning', `Balance refresh failed: ${error.message}`);
+    } finally {
+      setIsBalanceLoading(false);
+    }
+  }, []);
+
   // ============= WALLET CONNECTION =============
   const connectWallet = async () => {
     setIsConnecting(true);
@@ -224,13 +281,9 @@ export default function LimitlessTradingBot() {
 
       setWalletAddress(accounts[0]);
       setWalletConnected(true);
-      
-      // Simulate Limitless wallet (in production, this comes from their auth)
-      const mockLimitlessWallet = '0x' + accounts[0].slice(2, 10) + '...' + 'limitless' + accounts[0].slice(-4);
-      setLimitlessWallet(mockLimitlessWallet.slice(0, 42));
-      
-      // Mock balance for demo
-      setBalance(1247.83);
+      setLimitlessWallet('');
+      setBalance(0);
+      setBalanceError('');
 
       addActivity('success', 'Wallet connected successfully');
       addActivity('info', 'Connected to Base network');
@@ -290,21 +343,22 @@ export default function LimitlessTradingBot() {
       }
 
       const loginData = await loginRes.json();
-      const smartWalletAddr = loginData.smartWallet || limitlessWallet || address;
-      setLimitlessWallet(smartWalletAddr);
-      setAuthToken(signature);
-      setAuthStatus('authenticated');
-      addActivity('success', 'Authenticated with Limitless');
-
-      // Verify session cookie
+      let verifiedAccount = '';
       try {
         const verifyRes = await fetch(`${LIMITLESS_AUTH_API}/auth/verify-auth`, { credentials: 'include' });
-        if (!verifyRes.ok) {
-          throw new Error('Session verification failed');
+        if (verifyRes.ok) {
+          verifiedAccount = (await verifyRes.text()).trim();
         }
       } catch (verifyError) {
         addActivity('warning', `Session verify warning: ${verifyError.message}`);
       }
+
+      const smartWalletAddr = loginData.smartWallet || verifiedAccount || address;
+      setLimitlessWallet(smartWalletAddr);
+      setAuthToken(signature);
+      setAuthStatus('authenticated');
+      addActivity('success', 'Authenticated with Limitless');
+      updateSmartWalletBalance(smartWalletAddr);
 
       return true;
     } catch (error) {
@@ -328,6 +382,8 @@ export default function LimitlessTradingBot() {
     setWalletAddress('');
     setLimitlessWallet('');
     setBalance(0);
+    setIsBalanceLoading(false);
+    setBalanceError('');
     setAuthToken(null);
     setAuthStatus('idle');
     setAuthError('');
@@ -340,22 +396,64 @@ export default function LimitlessTradingBot() {
   const fetchMarkets = useCallback(async () => {
     setIsLoadingMarkets(true);
     try {
-      // In production: Fetch from Limitless API
-      // const response = await fetch(`${LIMITLESS_API}/markets?status=active&type=${marketType}`);
-      // const data = await response.json();
-      
-      // Demo mode: Generate mock markets
+      const response = await fetch(`${LIMITLESS_AUTH_API}/markets/active?page=1&limit=24&sortBy=newest`);
+      if (!response.ok) {
+        throw new Error('Failed to load markets from Limitless');
+      }
+
+      const data = await response.json();
+      const apiMarkets = (data.data || []).filter((m) => {
+        const categories = (m.categories || []).map((c) => c.toLowerCase());
+        return categories.includes(marketType);
+      });
+
+      const mappedMarkets = apiMarkets.map((m) => {
+        const yes = Number(normalizePrice(m.prices?.[0]).toFixed(4));
+        const no = Number(normalizePrice(m.prices?.[1]).toFixed(4));
+        const pairCost = Number((yes + no).toFixed(4));
+        const assetInfo = SUPPORTED_ASSETS.find((asset) =>
+          m.title?.toUpperCase().includes(`$${asset.id}`) || m.title?.toUpperCase().includes(asset.id)
+        );
+        const expiry = m.expirationTimestamp || m.expirationDate;
+
+        return {
+          id: m.slug || m.address || m.id,
+          asset: assetInfo?.id || m.asset || 'MARKET',
+          assetName: assetInfo?.name || m.title || 'Limitless Market',
+          assetIcon: assetInfo?.icon || '⧫',
+          assetColor: assetInfo?.color || '#7c3aed',
+          type: marketType,
+          question: m.title,
+          yesPrice: yes,
+          noPrice: no,
+          pairCost,
+          volume24h: Number(m.volumeFormatted || m.volume || 0),
+          liquidity: Number(m.liquidityFormatted || m.liquidity || 0),
+          expiryTime: expiry ? new Date(expiry).toISOString() : null,
+          timeRemaining: expiry ? Math.max(0, new Date(expiry).getTime() - Date.now()) : null,
+          yesVolatility: (Math.random() * 0.1).toFixed(4),
+          noVolatility: (Math.random() * 0.1).toFixed(4),
+        };
+      }).filter((m) => m.yesPrice > 0 && m.noPrice > 0);
+
+      if (!mappedMarkets.length) {
+        throw new Error('No active markets returned');
+      }
+
+      setDemoMode(false);
+      setMarkets(mappedMarkets);
+      if (!activeMarket || !mappedMarkets.find((m) => m.id === activeMarket.id)) {
+        setActiveMarket(mappedMarkets[0]);
+      }
+    } catch (error) {
+      setDemoMode(true);
+      addActivity('error', `Failed to fetch markets: ${error.message}`);
       const filteredAssets = SUPPORTED_ASSETS.filter(a => selectedAssets.includes(a.id));
       const mockMarkets = generateMockMarkets(filteredAssets, marketType);
-      
       setMarkets(mockMarkets);
-      
       if (!activeMarket && mockMarkets.length > 0) {
         setActiveMarket(mockMarkets[0]);
       }
-      
-    } catch (error) {
-      addActivity('error', `Failed to fetch markets: ${error.message}`);
     } finally {
       setIsLoadingMarkets(false);
     }
@@ -582,9 +680,15 @@ export default function LimitlessTradingBot() {
     }
   }, [walletConnected, selectedAssets, marketType, fetchMarkets]);
 
+  useEffect(() => {
+    if (authStatus === 'authenticated' && limitlessWallet) {
+      updateSmartWalletBalance(limitlessWallet);
+    }
+  }, [authStatus, limitlessWallet, updateSmartWalletBalance]);
+
   // Price updates simulation
   useEffect(() => {
-    if (!walletConnected) return;
+    if (!walletConnected || !demoMode) return;
     
     priceUpdateRef.current = setInterval(() => {
       setMarkets(prev => prev.map(market => {
@@ -862,10 +966,19 @@ export default function LimitlessTradingBot() {
                 <div className="rounded-2xl bg-gradient-to-br from-emerald-900/30 to-emerald-900/10 border border-emerald-500/20 p-4">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-xs text-emerald-400 uppercase tracking-wider">Balance</span>
-                    <DollarSign className="w-4 h-4 text-emerald-400" />
+                    <button
+                      onClick={() => updateSmartWalletBalance(limitlessWallet)}
+                      className="flex items-center gap-1 text-emerald-400 text-xs"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      Refresh
+                    </button>
                   </div>
-                  <div className="text-2xl font-bold text-emerald-400">{formatUSD(balance)}</div>
+                  <div className="text-2xl font-bold text-emerald-400 flex items-center gap-2">
+                    {isBalanceLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : formatUSD(balance)}
+                  </div>
                   <div className="text-xs text-emerald-400/60">USDC on Base</div>
+                  {balanceError && <div className="text-xs text-rose-400 mt-1">{balanceError}</div>}
                 </div>
               </div>
 
