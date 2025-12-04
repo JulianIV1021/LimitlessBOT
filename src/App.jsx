@@ -166,6 +166,7 @@ export default function LimitlessTradingBot() {
   const [walletConnected, setWalletConnected] = useState(false);
   const [walletAddress, setWalletAddress] = useState('');
   const [limitlessWallet, setLimitlessWallet] = useState('');
+  const [smartWalletOverride, setSmartWalletOverride] = useState('');
   const [balance, setBalance] = useState(0);
   const [isBalanceLoading, setIsBalanceLoading] = useState(false);
   const [balanceError, setBalanceError] = useState('');
@@ -345,6 +346,7 @@ export default function LimitlessTradingBot() {
         });
       }
 
+      const overrideSmartWallet = smartWalletOverride?.trim();
       const loginRes = await fetch(`${LIMITLESS_AUTH_API}/auth/login`, {
         method: 'POST',
         credentials: 'include',
@@ -356,7 +358,7 @@ export default function LimitlessTradingBot() {
         },
         body: JSON.stringify({
           client: 'base',
-          smartWallet: limitlessWallet || undefined,
+          smartWallet: overrideSmartWallet || limitlessWallet || undefined,
           r: '',
         }),
       });
@@ -388,12 +390,16 @@ export default function LimitlessTradingBot() {
       }
 
       const smartWalletAddr =
+        overrideSmartWallet ||
         extractSmartWallet(loginData) ||
         extractSmartWallet(verifiedPayload) ||
         extractAccount(verifiedPayload) ||
         extractAccount(loginData) ||
         address;
       setLimitlessWallet(smartWalletAddr);
+      if (smartWalletAddr && !overrideSmartWallet) {
+        setSmartWalletOverride(smartWalletAddr);
+      }
       setAuthToken(signature);
       setAuthStatus('authenticated');
       addActivity('success', 'Authenticated with Limitless');
@@ -420,6 +426,7 @@ export default function LimitlessTradingBot() {
     setWalletConnected(false);
     setWalletAddress('');
     setLimitlessWallet('');
+    setSmartWalletOverride('');
     setBalance(0);
     setIsBalanceLoading(false);
     setBalanceError('');
@@ -714,6 +721,30 @@ export default function LimitlessTradingBot() {
 
   // ============= EFFECTS =============
   useEffect(() => {
+    const savedSmartWallet = localStorage.getItem('smartWalletOverride');
+    if (savedSmartWallet) {
+      setSmartWalletOverride(savedSmartWallet);
+      if (!limitlessWallet) {
+        setLimitlessWallet(savedSmartWallet);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (smartWalletOverride) {
+      localStorage.setItem('smartWalletOverride', smartWalletOverride);
+    } else {
+      localStorage.removeItem('smartWalletOverride');
+    }
+  }, [smartWalletOverride]);
+
+  useEffect(() => {
+    if (smartWalletOverride && !limitlessWallet) {
+      setLimitlessWallet(smartWalletOverride);
+    }
+  }, [smartWalletOverride, limitlessWallet]);
+
+  useEffect(() => {
     if (walletConnected) {
       fetchMarkets();
     }
@@ -764,6 +795,16 @@ export default function LimitlessTradingBot() {
       if (botIntervalRef.current) clearInterval(botIntervalRef.current);
     };
   }, [botRunning, settings.checkInterval, runBotCycle]);
+
+  const applySmartWallet = () => {
+    if (smartWalletOverride) {
+      setLimitlessWallet(smartWalletOverride);
+      addActivity('info', 'Using provided Limitless smart wallet for authentication');
+      if (authStatus === 'authenticated') {
+        updateSmartWalletBalance(smartWalletOverride);
+      }
+    }
+  };
 
   // Copy address
   const copyToClipboard = async (text, type) => {
@@ -999,6 +1040,27 @@ export default function LimitlessTradingBot() {
                   {authError && (
                     <div className="text-xs text-rose-400 mt-1">{authError}</div>
                   )}
+                  <div className="mt-3 space-y-1">
+                    <label className="text-[11px] uppercase text-slate-400 font-semibold">Smart Wallet Override</label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={smartWalletOverride}
+                        onChange={(e) => setSmartWalletOverride(e.target.value)}
+                        placeholder="Paste smart wallet from Limitless web app"
+                        className="w-full bg-slate-800/60 border border-white/10 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-400"
+                      />
+                      <button
+                        onClick={applySmartWallet}
+                        className="px-3 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-xs font-bold"
+                      >
+                        Apply
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-slate-400 leading-tight">
+                      Provide the smart wallet shown in the Limitless web app so API login links to your existing wallet.
+                    </p>
+                  </div>
                 </div>
 
                 {/* Balance */}
