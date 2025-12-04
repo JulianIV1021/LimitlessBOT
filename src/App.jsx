@@ -357,7 +357,7 @@ export default function LimitlessTradingBot() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          client: 'base',
+          client: 'eoa',
           smartWallet: overrideSmartWallet || limitlessWallet || undefined,
           r: '',
         }),
@@ -393,9 +393,7 @@ export default function LimitlessTradingBot() {
         overrideSmartWallet ||
         extractSmartWallet(loginData) ||
         extractSmartWallet(verifiedPayload) ||
-        extractAccount(verifiedPayload) ||
-        extractAccount(loginData) ||
-        address;
+        limitlessWallet;
       setLimitlessWallet(smartWalletAddr);
       if (smartWalletAddr && !overrideSmartWallet) {
         setSmartWalletOverride(smartWalletAddr);
