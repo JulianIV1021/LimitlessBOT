@@ -73,6 +73,29 @@ const normalizePrice = (value) => {
   return value > 1 ? value / 100 : value;
 };
 
+const extractAccount = (payload) => {
+  if (!payload || typeof payload === 'string') return '';
+  return (
+    payload.account ||
+    payload.address ||
+    payload.wallet ||
+    payload.data?.account ||
+    ''
+  );
+};
+
+const extractSmartWallet = (payload) => {
+  if (!payload || typeof payload === 'string') return '';
+  return (
+    payload.smartWallet ||
+    payload.smart_wallet ||
+    payload.smartwallet ||
+    payload.data?.smartWallet ||
+    payload.data?.smart_wallet ||
+    ''
+  );
+};
+
 const buildBalanceOfData = (address) => {
   const sanitized = address.replace('0x', '').padStart(64, '0');
   return `0x70a08231000000000000000000000000${sanitized}`;
@@ -342,18 +365,34 @@ export default function LimitlessTradingBot() {
         throw new Error('Limitless login failed');
       }
 
-      const loginData = await loginRes.json();
-      let verifiedAccount = '';
+      let loginData;
+      try {
+        loginData = await loginRes.json();
+      } catch (_) {
+        loginData = null;
+      }
+
+      let verifiedPayload = null;
       try {
         const verifyRes = await fetch(`${LIMITLESS_AUTH_API}/auth/verify-auth`, { credentials: 'include' });
         if (verifyRes.ok) {
-          verifiedAccount = (await verifyRes.text()).trim();
+          try {
+            verifiedPayload = await verifyRes.json();
+          } catch (_) {
+            const text = await verifyRes.text();
+            verifiedPayload = text ? { account: text.trim() } : null;
+          }
         }
       } catch (verifyError) {
         addActivity('warning', `Session verify warning: ${verifyError.message}`);
       }
 
-      const smartWalletAddr = loginData.smartWallet || verifiedAccount || address;
+      const smartWalletAddr =
+        extractSmartWallet(loginData) ||
+        extractSmartWallet(verifiedPayload) ||
+        extractAccount(verifiedPayload) ||
+        extractAccount(loginData) ||
+        address;
       setLimitlessWallet(smartWalletAddr);
       setAuthToken(signature);
       setAuthStatus('authenticated');
@@ -396,7 +435,7 @@ export default function LimitlessTradingBot() {
   const fetchMarkets = useCallback(async () => {
     setIsLoadingMarkets(true);
     try {
-      const response = await fetch(`${LIMITLESS_AUTH_API}/markets/active?page=1&limit=24&sortBy=newest`);
+      const response = await fetch(`${LIMITLESS_API}/markets/active?page=1&limit=24&sortBy=newest`);
       if (!response.ok) {
         throw new Error('Failed to load markets from Limitless');
       }
